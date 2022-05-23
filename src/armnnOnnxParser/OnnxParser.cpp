@@ -439,6 +439,33 @@ TensorInfo ComputeReshapeInfo(const TensorShape& targetShapeTensor,
     return TensorInfo(outShape, dataType);
 }
 
+TensorInfo ComputeReduceInfo(const TensorShape& inShape,
+                             const std::vector<uint32_t>& dims,
+                             const uint32_t keepdims,
+                             DataType dataType = DataType::Float32)
+{
+    std::vector<unsigned int> outDims;
+    if (dims.size())
+    {
+        for (uint i = 0; i < inShape.GetNumDimensions(); ++i)
+        {
+            if (std::find(dims.begin(), dims.end(), i) != dims.end())
+            {
+                if (keepdims)
+                {
+                    outDims.push_back(1);
+                }
+            }
+            else
+            {
+                outDims.push_back(inShape[i]);
+            }
+        }
+    }
+
+    TensorShape outShape = TensorShape{static_cast<unsigned int>(outDims.size()), outDims.data()};
+    return TensorInfo(outShape, dataType);
+}
 } //namespace
 
 const std::map<std::string, OnnxParserImpl::OperationParsingFunction> OnnxParserImpl::m_ParserFunctions = {
@@ -460,7 +487,8 @@ const std::map<std::string, OnnxParserImpl::OperationParsingFunction> OnnxParser
     { "Gather",                &OnnxParserImpl::ParseGather },
     { "Unsqueeze",             &OnnxParserImpl::ParseUnsqueeze },
     { "Concat",                &OnnxParserImpl::ParseConcat },
-    { "Gemm",                  &OnnxParserImpl::ParseGemm }
+    { "Gemm",                  &OnnxParserImpl::ParseGemm },
+    { "ReduceSum",             &OnnxParserImpl::ParseReduceSum }
 };
 
 template<typename TypePair, typename Location>
@@ -2209,6 +2237,35 @@ void OnnxParserImpl::ParseUnsqueeze(const onnx::NodeProto& node)
     m_TensorsInfo[node.output(0)].m_dtype = m_TensorsInfo[node.input(0)].m_dtype;
 
     CreateReshapeLayer(node.input(0), node.output(0), node.name());
+}
+
+void OnnxParserImpl::ParseReduceSum(const onnx::NodeProto& node){
+    TensorShape inputShape = m_TensorsInfo[node.input(0)].m_info->GetShape();
+    const auto dims = ReadMandatoryNodeUint32ListAttribute(node, "axes");
+    const auto keepdims = ReadOptionalNodeUint32Attribute(node, "keepdims");
+
+    const auto& inputName = node.input(0);
+    const auto& outputName = node.output(0);
+    const auto& layerName = node.name();
+    
+    auto outInfo = ComputeReduceInfo(inputShape, dims, keepdims, m_TensorsInfo[node.input(0)].m_info->GetDataType());
+    m_TensorsInfo[node.output(0)].m_info = std::make_unique<TensorInfo>(outInfo);
+    m_TensorsInfo[node.output(0)].m_dtype = m_TensorsInfo[node.input(0)].m_dtype;
+
+    const TensorInfo outputTensorInfo = *m_TensorsInfo[outputName].m_info;
+
+    armnn::ReduceDescriptor descriptor;
+    descriptor.m_vAxis = dims;
+    descriptor.m_KeepDims = keepdims;
+    descriptor.m_ReduceOperation = armnn::ReduceOperation::Sum;
+
+    IConnectableLayer* layer = m_Network->AddReduceLayer(descriptor, layerName.c_str());
+    ARMNN_ASSERT(layer != nullptr);
+    layer->GetOutputSlot(0).SetTensorInfo(outputTensorInfo);
+
+    RegisterInputSlots(layer, {inputName});
+    
+    RegisterOutputSlots(layer, {outputName});
 }
 
 void OnnxParserImpl::PrependForBroadcast(const std::string& outputName,

@@ -139,6 +139,7 @@ private:
     void ParseShape(const onnx::NodeProto& node);
     void ParseReshape(const onnx::NodeProto& nodeProto);
     void ParseUnsqueeze(const onnx::NodeProto& nodeProto);
+    void ParseReduceSum(const onnx::NodeProto& nodeProto);
 
     void RegisterInputSlot(armnn::IConnectableLayer* layer,
                            const std::string& tensorId,
