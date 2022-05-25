@@ -55,7 +55,7 @@ int32_t VerifyInt32(const char* expr,
 {
     if (value < std::numeric_limits<int>::min()  || value > std::numeric_limits<int>::max())
     {
-        throw ParseException(fmt::format("'{}' must should fit into a int32 (ArmNN don't support int64),"
+        throw ParseException(fmt::format("'{}' must should fit into a int32 (ArmNN doesn't support int64),"
                                          " received: {} at {}",
                                          expr,
                                          value,

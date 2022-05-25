@@ -440,16 +440,16 @@ TensorInfo ComputeReshapeInfo(const TensorShape& targetShapeTensor,
 }
 
 TensorInfo ComputeReduceInfo(const TensorShape& inShape,
-                             const std::vector<uint32_t>& dims,
-                             const uint32_t keepdims,
+                             const std::vector<uint32_t>& axes,
+                             const int64_t keepdims,
                              DataType dataType = DataType::Float32)
 {
     std::vector<unsigned int> outDims;
-    if (dims.size())
+    if (axes.size())
     {
         for (uint i = 0; i < inShape.GetNumDimensions(); ++i)
         {
-            if (std::find(dims.begin(), dims.end(), i) != dims.end())
+            if (std::find(axes.begin(), axes.end(), i) != axes.end())
             {
                 if (keepdims)
                 {
@@ -462,6 +462,13 @@ TensorInfo ComputeReduceInfo(const TensorShape& inShape,
             }
         }
     }
+
+    std::cout << "outDims = [";
+    for (const auto& d: outDims)
+    {
+        std::cout << d << ",";
+    }
+    std::cout << "]" << std::endl;
 
     TensorShape outShape = TensorShape{static_cast<unsigned int>(outDims.size()), outDims.data()};
     return TensorInfo(outShape, dataType);
@@ -482,6 +489,7 @@ const std::map<std::string, OnnxParserImpl::OperationParsingFunction> OnnxParser
     { "LeakyRelu",             &OnnxParserImpl::ParseLeakyRelu },
     { "Conv",                  &OnnxParserImpl::ParseConv },
     { "Add",                   &OnnxParserImpl::ParseAdd },
+    { "Div",                   &OnnxParserImpl::ParseDiv },
     { "Flatten",               &OnnxParserImpl::ParseFlatten },
     { "Shape",                 &OnnxParserImpl::ParseShape },
     { "Gather",                &OnnxParserImpl::ParseGather },
@@ -532,6 +540,17 @@ std::vector<TensorInfo> OnnxParserImpl::ComputeOutputInfo(std::vector<std::strin
     DataType armnnType = DataType::Float32;
     if(needCompute) {
         inferredShapes = layer->InferOutputShapes(inputShapes);
+        std::cout << "inferredShapes:" << std::endl;
+        for (const auto& shape: inferredShapes)
+        {
+            std::cout << "[";
+            for (uint i = 0; i < shape.GetNumDimensions(); i++)
+            {
+                std::cout << shape[i] << ",";
+            }
+            std::cout << "]" << std::endl;
+        }
+        
         ARMNN_ASSERT(inferredShapes.size() == outNames.size());
         switch (dataType) {
             case onnx::TensorProto::FLOAT: {
@@ -1489,6 +1508,66 @@ void OnnxParserImpl::ParseAdd(const onnx::NodeProto& node)
     RegisterOutputSlots(layer, {node.output(0)});
 }
 
+void OnnxParserImpl::ParseDiv(const onnx::NodeProto& node)
+{
+    std::cout << "ParseDiv" << std::endl;
+    CHECK_VALID_SIZE(static_cast<size_t>(node.input_size()), 2);
+    CHECK_VALID_SIZE(static_cast<size_t>(node.output_size()), 1);
+
+    VALID_INPUTS(node, STR_LIST(onnx::TensorProto::FLOAT));
+
+    // TODO: unify broadcast validation code across layers
+    // tracked by: IVGCVSW-1576
+
+    // Checking broadcast compatibility : only scalar or 1D tensors
+    auto inputs = AddPrepareBroadcast(node.input(0), node.input(1));
+    auto input0 = *m_TensorsInfo[inputs.first].m_info;
+    auto input1 = *m_TensorsInfo[inputs.second].m_info;
+    ARMNN_ASSERT(input0.GetNumDimensions() == input1.GetNumDimensions());
+
+    unsigned int numDims = input0.GetNumDimensions();
+    for (unsigned int i = 0; i < numDims; i++)
+    {
+        unsigned int dim0 = input0.GetShape()[i];
+        unsigned int dim1 = input1.GetShape()[i];
+        if (dim0 != dim1 && dim0 != 1 && dim1 != 1)
+        {
+            throw ParseException(
+                fmt::format("Broadcast is only supported for scalar or 1D tensors in Div node '{}'. "
+                            "Input dimensions should either match or one should be of size 1 and here, "
+                            "{} and {} {}",
+                            node.name(),
+                            TensorInfoAsString(*m_TensorsInfo[inputs.first].m_info, inputs.first,
+                                               m_TensorsInfo[inputs.first].m_dtype),
+                            TensorInfoAsString(*m_TensorsInfo[inputs.second].m_info, inputs.second,
+                                               m_TensorsInfo[inputs.second].m_dtype),
+                            CHECK_LOCATION().AsString()));
+        }
+    }
+
+
+    IConnectableLayer* layer = m_Network->AddDivisionLayer(node.name().c_str());
+    ARMNN_ASSERT(layer != nullptr);
+
+    auto outputInfo = ComputeOutputInfo({ node.output(0) }, layer,
+                                        { m_TensorsInfo[inputs.first].m_info->GetShape(),
+                                          m_TensorsInfo[inputs.second].m_info->GetShape() });
+    layer->GetOutputSlot(0).SetTensorInfo(outputInfo[0]);
+
+    // register the input connection -> for constant inputs, we need to make a newDim constant layer
+    if(m_TensorsInfo[inputs.first].isConstant()) {
+        CreateConstantLayer(inputs.first, fmt::format("Div:constant_of_{}", node.input(0)));
+    }
+    if(m_TensorsInfo[inputs.second].isConstant()) {
+        CreateConstantLayer(inputs.second, fmt::format("Div:constant_of_{}", node.input(1)));
+    }
+    RegisterInputSlots(layer, {inputs.first, inputs.second});
+
+    // register the output connection
+    RegisterOutputSlots(layer, {node.output(0)});
+    std::cout << node.name() << "done" << std::endl;
+}
+
 void OnnxParserImpl::ParseAveragePool(const onnx::NodeProto& node)
 {
     Pooling2dDescriptor desc;
@@ -2241,21 +2320,52 @@ void OnnxParserImpl::ParseUnsqueeze(const onnx::NodeProto& node)
 
 void OnnxParserImpl::ParseReduceSum(const onnx::NodeProto& node){
     TensorShape inputShape = m_TensorsInfo[node.input(0)].m_info->GetShape();
-    const auto dims = ReadMandatoryNodeUint32ListAttribute(node, "axes");
-    const auto keepdims = ReadOptionalNodeUint32Attribute(node, "keepdims");
+
+    const auto keepdims = ReadOptionalNodeInt64Attribute(node, "keepdims");
+
+    unsigned int dims = 1  ; // static_cast<unsigned int>(m_TensorsInfo[node.input(1)].m_tensor->int64_data_size());
+    std::cout << node.input(1) << " = " << dims << std::endl;
+    std::vector<uint32_t> axes = {static_cast<uint32_t>(static_cast<int32_t>(inputShape.GetNumDimensions()) -1)};
+    // std::vector<uint32_t> axes(dims);
+    // for(uint i = 0; i < dims; i++)
+    // {
+    //     int val = CHECKED_INT32(m_TensorsInfo[node.input(1)].m_tensor->int64_data(static_cast<int>(i)));
+
+    //     if (val < 0)
+    //     {
+    //         val = static_cast<int32_t>(inputShape.GetNumDimensions()) - val;
+    //     }
+
+    //     axes.push_back(static_cast<uint32_t>(val));
+    // }
+
+    std::cout << "axes = [";
+    for (const auto& a: axes)
+    {
+        std::cout << a << ",";
+    }
+    std::cout << "], keepdims = " << keepdims << std::endl;
 
     const auto& inputName = node.input(0);
     const auto& outputName = node.output(0);
     const auto& layerName = node.name();
     
-    auto outInfo = ComputeReduceInfo(inputShape, dims, keepdims, m_TensorsInfo[node.input(0)].m_info->GetDataType());
+    auto outInfo = ComputeReduceInfo(inputShape, axes, keepdims, m_TensorsInfo[node.input(0)].m_info->GetDataType());
     m_TensorsInfo[node.output(0)].m_info = std::make_unique<TensorInfo>(outInfo);
     m_TensorsInfo[node.output(0)].m_dtype = m_TensorsInfo[node.input(0)].m_dtype;
+
+    const auto shape = m_TensorsInfo[node.output(0)].m_info->GetShape();
+     std::cout << "[";
+    for (uint i = 0; i < shape.GetNumDimensions(); ++i)
+    {
+         std::cout << shape[i] << ",";
+    }
+    std::cout << "]" << std::endl;
 
     const TensorInfo outputTensorInfo = *m_TensorsInfo[outputName].m_info;
 
     armnn::ReduceDescriptor descriptor;
-    descriptor.m_vAxis = dims;
+    descriptor.m_vAxis = axes;
     descriptor.m_KeepDims = keepdims;
     descriptor.m_ReduceOperation = armnn::ReduceOperation::Sum;
 

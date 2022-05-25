@@ -126,6 +126,7 @@ private:
     void ParseLeakyRelu(const onnx::NodeProto& nodeProto);
 
     void ParseAdd(const onnx::NodeProto& nodeProto);
+    void ParseDiv(const onnx::NodeProto& nodeProto);
     void ParseAveragePool(const onnx::NodeProto& nodeProto);
     void ParseBatchNormalization(const onnx::NodeProto& node);
     void ParseConcat(const onnx::NodeProto& nodeProto);
